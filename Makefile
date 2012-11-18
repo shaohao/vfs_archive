@@ -12,7 +12,7 @@ DST_OBJS = $(NAME).o
 $(NAME).so: $(DST_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
-install:
+install: $(NAME).so
 	-mkdir -p ~/.local/lib/deadbeef
 	-cp $(NAME).so ~/.local/lib/deadbeef
 

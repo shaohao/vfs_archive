@@ -33,19 +33,15 @@ typedef struct {
 	int64_t size;
 } archive_file_t;
 
-static const char *scheme_names[] = {
-	"7z://",
-	"tar://",
-	"cpio://",
-	"iso://",
-//	"zip://", /* supported by vfs_zip */
-	"ar://",
-	"cab://",
-	"lha://",
-	"rar://",
-	"xar://",
-	NULL,
-};
+/* Exclude the zip format, use vfs_zip instead */
+#define DEFAULT_FORMATS "tar;par;cpio;iso;ar;xar;lha;lzh;rar;cab;7z;xz"
+#define DEFAULT_FILTERS "gz;bz2;Z;uu;xz;lzip;lzma"
+#define FMT_MAX 200
+static char schemes[FMT_MAX];
+static const char *scheme_names[FMT_MAX] = { NULL };
+
+#define FORMAT_KEY "archive.formats"
+#define FILTER_KEY "archive.filters"
 
 struct archive_entry *
 open_archive_entry(struct archive *a, const char *aname, const char *fname)
@@ -74,11 +70,80 @@ open_archive_entry(struct archive *a, const char *aname, const char *fname)
 	return found ? ae : NULL;
 }
 
+void ext2scheme(const char *exts, char **schemes_p)
+{
+	const char *p;
+	char scheme[10];
+	int i;
+
+	i = 0;
+	for (p = exts; *p; p++) {
+		if (*p == ';') {
+			scheme[i] = '\0';
+			sprintf(*schemes_p, "%s://", scheme);
+			*schemes_p += strlen(scheme) + 3 + 1;
+			i = 0;
+		}
+		else {
+			scheme[i++] = *p;
+		}
+	}
+	if (i) {
+		scheme[i] = '\0';
+		sprintf(*schemes_p, "%s://", scheme);
+		*schemes_p += strlen(scheme) + 3 + 1;
+	}
+}
+
+void
+load_scheme_names(void)
+{
+	char formats[100];
+	char filters[100];
+	int i;
+	char *p;
+
+	if (scheme_names[0])
+		return ;
+
+	p = schemes;
+
+	deadbeef->conf_get_str(
+		FORMAT_KEY,
+		DEFAULT_FORMATS,
+		formats,
+		sizeof(formats)
+	);
+	ext2scheme(formats, &p);
+
+	deadbeef->conf_get_str(
+		FILTER_KEY,
+		DEFAULT_FILTERS,
+		filters,
+		sizeof(filters)
+	);
+	ext2scheme(filters, &p);
+
+	i = 0;
+	p = schemes;
+	while (*p) {
+		scheme_names[i++] = p;
+		trace("scheme_names: %s\n", p);
+		p += strlen(p) + 1;
+
+	}
+	scheme_names[i] = '\0';
+}
+
 //-----------------------------------------------------------------------------
+
+const char *new_schemes[] = { "rar://", NULL };
 
 const char **
 vfs_archive_get_schemes(void)
 {
+	load_scheme_names();
+
 	return scheme_names;
 }
 
@@ -295,6 +360,8 @@ vfs_archive_scandir(
 int
 vfs_archive_is_container(const char *fname)
 {
+	load_scheme_names();
+
 	const char *ext = strrchr(fname, '.');
 	int found = 0;
 	for (const char **p = &(scheme_names[0]); *p; p++) {
@@ -307,8 +374,12 @@ vfs_archive_is_container(const char *fname)
 	return found;
 }
 
-/* boilerplate */
+static const char settings_dlg[] =
+	"property \"Formats\" entry archive.formats \"" DEFAULT_FORMATS "\";\n"
+	"property \"Filters\" entry archvie.filters \"" DEFAULT_FILTERS "\";\n"
+;
 
+/* define plugin interface */
 static DB_vfs_t plugin = {
 	.plugin.api_vmajor = 1,
 	.plugin.api_vminor = 0,
@@ -335,6 +406,7 @@ static DB_vfs_t plugin = {
 		"along with this program; if not, write to the Free Software\n"
 		"Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.\n",
 	.plugin.website = "http://github.com/shaohao/archive_archive",
+	.plugin.configdialog = settings_dlg,
 	.open = vfs_archive_open,
 	.close = vfs_archive_close,
 	.read = vfs_archive_read,
