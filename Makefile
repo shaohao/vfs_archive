@@ -1,23 +1,28 @@
-DEBUG=0
-CC=gcc
-NAME = vfs_archive
-ifeq ($(DEBUG),1)
-CFLAGS = -g -c -std=c99 -fPIC -Wall -DDEBUG
-else
-CFLAGS = -c -std=c99 -fPIC -Wall
-endif
-LDFLAGS = -shared -fPIC -larchive
-DST_OBJS = $(NAME).o
+APP = vfs_archive
+BIN = $(APP).so
+DEBUG ?= 0
 
-$(NAME).so: $(DST_OBJS)
+CC = gcc
+
+CFLAGS = -c -std=c99 -fPIC -Wall
+ifeq ($(DEBUG),1)
+CFLAGS += -g -DDEBUG
+endif
+
+LDFLAGS = -shared -fPIC -larchive
+
+OBJS = $(APP).o
+
+.PHONY: $(BIN)
+$(BIN): $(OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
-install: $(NAME).so
+install: $(APP).so
 	-mkdir -p ~/.local/lib/deadbeef
-	-cp $(NAME).so ~/.local/lib/deadbeef
+	-cp $(APP).so ~/.local/lib/deadbeef
 
 uninstall:
-	-rm -rf ~/.local/lib/deadbeef/$(NAME).so
+	-rm -rf ~/.local/lib/deadbeef/$(APP).so
 
 clean:
 	-rm -rf *.so *.o

@@ -8,7 +8,7 @@
 #include <archive_entry.h>
 #include <archive.h>
 
-//-----------------------------------------------------------------------------
+/*---------------------------------------------------------------------------*/
 
 #ifdef DEBUG
 #define trace(...) { fprintf(stderr, __VA_ARGS__); }
@@ -21,6 +21,17 @@
 static DB_functions_t *deadbeef;
 static DB_vfs_t plugin;
 
+#define POOL_SIZE (1024*5)
+
+typedef struct {
+	void *data;
+
+	size_t size;
+	size_t offset;
+	size_t end;
+	size_t isfull;
+} cbuffer_t;
+
 typedef struct {
 	DB_FILE file;
 
@@ -31,9 +42,11 @@ typedef struct {
 
 	int64_t offset;
 	int64_t size;
+
+	cbuffer_t *buffer;
 } archive_file_t;
 
-/* Exclude the zip format, use vfs_zip instead */
+/* Zip format is supported by the builtin vfs_zip plugin */
 #define DEFAULT_FORMATS "tar;par;cpio;iso;ar;xar;lha;lzh;rar;cab;7z;xz"
 #define DEFAULT_FILTERS "gz;bz2;Z;uu;xz;lzip;lzma"
 #define FMT_MAX 200
@@ -42,6 +55,129 @@ static const char *scheme_names[FMT_MAX] = { NULL };
 
 #define FORMAT_KEY "archive.formats"
 #define FILTER_KEY "archive.filters"
+
+/*---------------------------------------------------------------------------*/
+
+void
+malloc_cbuffer(cbuffer_t *buffer, size_t sz)
+{
+	buffer->data = calloc(sz, sizeof(char));
+	buffer->size = sz;
+}
+
+void
+free_cbuffer(cbuffer_t *buffer)
+{
+	free(buffer->data);
+}
+
+void
+init_cbuffer(cbuffer_t *buffer)
+{
+	buffer->end = 0;
+	buffer->offset = 0;
+	buffer->isfull = 0;
+}
+
+size_t
+read_from_cbuffer(cbuffer_t *buffer, void *ptr, size_t sz)
+{
+	size_t valid;
+
+	if (buffer->offset <= buffer->end)
+		valid = buffer->end - buffer->offset;
+	else
+		valid = buffer->end + (buffer->size - buffer->offset);
+
+	if (0 == valid)
+		return 0;
+
+	size_t read_sz = min(valid, sz);
+
+	if (buffer->offset < buffer->end) {
+		memcpy(ptr, buffer->data + buffer->offset, read_sz);
+		buffer->offset += read_sz;
+	}
+	else {
+		size_t offset_gap = buffer->size - buffer->offset;
+		if (offset_gap >= read_sz) {
+			memcpy(ptr, buffer->data + buffer->offset, read_sz);
+			buffer->offset += read_sz;
+		}
+		else {
+			memcpy(ptr, buffer->data + buffer->offset, offset_gap);
+			memcpy(ptr, buffer->data, read_sz - offset_gap);
+			buffer->offset = read_sz - offset_gap;
+		}
+	}
+
+	return read_sz;
+}
+
+void
+write_to_cbuffer(cbuffer_t *buffer, const void *ptr, size_t sz)
+{
+	assert(buffer->offset == buffer->end);
+
+	size_t write_sz = min(sz, buffer->size);
+	const void *write_ptr = ptr + (sz - write_sz);
+	size_t end_gap = buffer->size - buffer->end;
+	if (end_gap >= write_sz) {
+		memcpy(buffer->data + buffer->end, write_ptr, write_sz);
+		buffer->end += write_sz;
+		if (!buffer->isfull && buffer->end >= buffer->size)
+			buffer->isfull = 1;
+	}
+	else {
+		memcpy(buffer->data + buffer->end, write_ptr, end_gap);
+		memcpy(buffer->data, write_ptr + end_gap, write_sz - end_gap);
+		buffer->end = write_sz - end_gap;
+		buffer->isfull = 1;
+	}
+
+	buffer->offset = buffer->end;
+}
+
+int64_t
+seek_in_cbuffer(cbuffer_t *buffer, int64_t delta)
+{
+	if (delta == 0)
+		return 0;
+
+	size_t valid;
+	if (buffer->offset <= buffer->end)
+		valid = buffer->end - buffer->offset;
+	else
+		valid = buffer->end + (buffer->size - buffer->offset);
+
+	size_t bvalid;
+	if (buffer->isfull)
+		bvalid = buffer->size - valid;
+	else
+		bvalid = buffer->end - valid;
+
+	/* seek delta is too large */
+	if (   (delta > 0 && delta > valid)
+		|| (delta < 0 && -delta > bvalid)
+	) {
+		return -1;
+	}
+
+	if (delta < 0) {
+		buffer->offset += delta;
+		if (buffer->offset < 0)
+			buffer->offset += buffer->size;
+	}
+	else /* if (delta > 0) */ {
+		buffer->offset += delta;
+		if (buffer->offset >= buffer->size)
+			buffer->offset -= buffer->size;
+	}
+
+	return 0;
+}
+
+/*---------------------------------------------------------------------------*/
 
 struct archive_entry *
 open_archive_entry(struct archive *a, const char *aname, const char *fname)
@@ -55,7 +191,7 @@ open_archive_entry(struct archive *a, const char *aname, const char *fname)
 	if (ARCHIVE_OK != archive_read_open_filename(a, aname, 10240))
 		return NULL;
 
-	// find the desired file from archive
+	/* find the desired file from archive */
 	trace("searching file %s\n", fname);
 	found = 0;
 	while (ARCHIVE_OK == archive_read_next_header(a, &ae)) {
@@ -70,7 +206,70 @@ open_archive_entry(struct archive *a, const char *aname, const char *fname)
 	return found ? ae : NULL;
 }
 
-void ext2scheme(const char *exts, char **schemes_p)
+size_t
+read_data(archive_file_t *af, void *ptr, size_t sz)
+{
+	size_t n;
+
+	n = read_from_cbuffer(af->buffer, ptr, sz);
+
+	if (n < sz) {
+		ssize_t rb = archive_read_data(af->a, ptr+n, sz-n);
+		if (rb < 0)
+			rb = 0;
+
+		if (rb) {
+			write_to_cbuffer(af->buffer, ptr+n, rb);
+			n += rb;
+		}
+	}
+
+	af->offset += n;
+
+	return n;
+}
+
+int
+seek_data(archive_file_t *af, int64_t offset)
+{
+	if (0 == seek_in_cbuffer(af->buffer, offset - af->offset)) {
+		af->offset = offset;
+		return 0;
+	}
+
+	if (offset < af->offset) {
+		/* reopen */
+		archive_read_free(af->a);
+
+		af->a = archive_read_new();
+		archive_read_support_format_all(af->a);
+		archive_read_support_filter_all(af->a);
+
+		if (!open_archive_entry(af->a, af->aname, af->fname))
+			return -1;
+
+		af->offset = 0;
+		init_cbuffer(af->buffer);
+	}
+
+	char buf[4096];
+	int64_t n = offset - af->offset;
+	while (n > 0) {
+		size_t sz = min(n, sizeof(buf));
+		size_t rb = read_data(af, buf, sz);
+		n -= rb;
+		assert(n >= 0);
+		if (rb != sz)
+			break;
+	}
+	if (n > 0)
+		return -1;
+
+	return 0;
+}
+
+void
+ext2scheme(const char *exts, char **schemes_p)
 {
 	const char *p;
 	char scheme[10];
@@ -135,13 +334,12 @@ load_scheme_names(void)
 	scheme_names[i] = '\0';
 }
 
-//-----------------------------------------------------------------------------
-
-const char *new_schemes[] = { "rar://", NULL };
+/*---------------------------------------------------------------------------*/
 
 const char **
 vfs_archive_get_schemes(void)
 {
+	trace("[vfs_archive_get_schemes]\n");
 	load_scheme_names();
 
 	return scheme_names;
@@ -150,26 +348,27 @@ vfs_archive_get_schemes(void)
 int
 vfs_archive_is_streaming(void)
 {
+	trace("[vfs_archive_is_streaming]\n");
 	return 0;
 }
 
-// fname must have form of zip://full_filepath.zip:full_filepath_in_zip
+/* fname must have form of zip://full_filepath.zip:full_filepath_in_zip */
 DB_FILE*
 vfs_archive_open(const char *fname)
 {
 	trace("[vfs_archive_open] %s\n", fname);
-	int found = 0;
+	const char *scheme = NULL;
 	for (const char **p = &(scheme_names[0]); *p; p++) {
 		if (!strncasecmp(fname, *p, strlen(*p))) {
-			found = 1;
+			scheme = *p;
 			break;
 		}
 	}
-	if (!found)
+	if (!scheme)
 		return NULL;
 
-	// get the full path of this archive file
-	fname += 6;
+	/* get the full path of this archive file */
+	fname += strlen(scheme);
 	const char *colon = strchr(fname, ':');
 	if (!colon) {
 		return NULL;
@@ -179,7 +378,7 @@ vfs_archive_open(const char *fname)
 	memcpy(aname, fname, colon-fname);
 	aname[colon-fname] = '\0';
 
-	// get the compressed file entry in this archive
+	/* get the compressed file entry in this archive */
 	fname = colon+1;
 
 	struct archive *a = archive_read_new();
@@ -202,22 +401,27 @@ vfs_archive_open(const char *fname)
 	af->offset = 0;
 	af->size = archive_entry_size(ae);
 
+	af->buffer = (cbuffer_t *)malloc(sizeof(cbuffer_t));
+	malloc_cbuffer(af->buffer, POOL_SIZE);
+	init_cbuffer(af->buffer);
+
 	return (DB_FILE*)af;
 }
 
 void
 vfs_archive_close(DB_FILE *f)
 {
+	trace("[vfs_archive_close]\n");
 	archive_file_t *af = (archive_file_t *)f;
 
-	if (af->a)
-		archive_read_free(af->a);
+	archive_read_free(af->a);
 
-	if (af->aname)
-		free(af->aname);
+	free(af->aname);
 
-	if (af->fname)
-		free(af->fname);
+	free(af->fname);
+
+	free_cbuffer(af->buffer);
+	free(af->buffer);
 
 	free(af);
 }
@@ -225,23 +429,22 @@ vfs_archive_close(DB_FILE *f)
 size_t
 vfs_archive_read(void *ptr, size_t size, size_t nmemb, DB_FILE *f)
 {
-	trace("[vfs_archive_read]\n");
 	archive_file_t *af = (archive_file_t *)f;
 
-	ssize_t rb = archive_read_data(af->a, ptr, size * nmemb);
-	if (rb < 0)
-		rb = 0;
+	trace("[vfs_archive_read] sz: %d, offset: %ld\n", (int)(size * nmemb), af->offset);
 
-	af->offset += rb;
-
+	size_t rb = read_data(af, ptr, size * nmemb);
 	return rb / size;
 }
 
 int
 vfs_archive_seek(DB_FILE *f, int64_t offset, int whence)
 {
-	trace("[vfs_archive_seek]");
 	archive_file_t *af = (archive_file_t *)f;
+
+	/* try builtin seek function first */
+	if (0 <= archive_seek_data(af->a, offset, whence))
+		return 0;
 
 	if (whence == SEEK_CUR) {
 		offset = af->offset + offset;
@@ -252,47 +455,24 @@ vfs_archive_seek(DB_FILE *f, int64_t offset, int whence)
 
 	if (offset < 0 || offset > af->size)
 		return -1;
-	else if (offset < af->offset) {
-		/* reopen */
-		archive_read_free(af->a);
 
-		af->a = archive_read_new();
-		archive_read_support_format_all(af->a);
-		archive_read_support_filter_all(af->a);
+	trace("[vfs_archive_seek] old-offset: %ld, new-offset: %ld\n", af->offset, offset);
 
-		if (!open_archive_entry(af->a, af->aname, af->fname))
-			return -1;
-
-		af->offset = 0;
-	}
-
-	char buf[4096];
-	int64_t n = offset - af->offset;
-	while (n > 0) {
-		int sz = min(n, sizeof(buf));
-		ssize_t rb = archive_read_data(af->a, buf, sz);
-		n -= rb;
-		assert(n >= 0);
-		af->offset += rb;
-		if (rb != sz)
-			break;
-	}
-	if (n > 0)
-		return -1;
-
-	return 0;
+	return seek_data(af, offset);
 }
 
 int64_t
 vfs_archive_tell(DB_FILE *f)
 {
 	archive_file_t *af = (archive_file_t *)f;
+	trace("[vfs_archive_tell] offset: %ld\n", af->offset);
 	return af->offset;
 }
 
 void
 vfs_archive_rewind(DB_FILE *f)
 {
+	trace("[vfs_archive_rewind]\n");
 	archive_file_t *af = (archive_file_t *)f;
 
 	/* reopen */
@@ -306,11 +486,13 @@ vfs_archive_rewind(DB_FILE *f)
 	assert(open_archive_entry(af->a, af->aname, af->fname));
 
 	af->offset = 0;
+	init_cbuffer(af->buffer);
 }
 
 int64_t
 vfs_archive_getlength(DB_FILE *f)
 {
+	trace("[vfs_archive_getlength]\n");
 	archive_file_t *af = (archive_file_t *)f;
 	return af->size;
 }
@@ -323,6 +505,8 @@ vfs_archive_scandir(
 	int (*cmp)(const struct dirent **, const struct dirent **)
 )
 {
+	trace("[vfs_archive_scandir]\n");
+
 	int n;
 
 	struct archive *a;
@@ -344,7 +528,7 @@ vfs_archive_scandir(
 		snprintf(
 			(*namelist)[n]->d_name,
 			sizeof((*namelist)[n]->d_name),
-			"rar://%s:%s", dir, archive_entry_pathname(ae)
+			"rar://%s:%s", dir, archive_entry_pathname(ae) /*TODO: fix rar */
 		);
 
 		archive_read_data_skip(a);
@@ -360,6 +544,8 @@ vfs_archive_scandir(
 int
 vfs_archive_is_container(const char *fname)
 {
+	trace("[vfs_archive_is_container]\n");
+
 	load_scheme_names();
 
 	const char *ext = strrchr(fname, '.');
@@ -383,14 +569,14 @@ static const char settings_dlg[] =
 static DB_vfs_t plugin = {
 	.plugin.api_vmajor = 1,
 	.plugin.api_vminor = 0,
-	.plugin.version_major = 1,
+	.plugin.version_major = 2,
 	.plugin.version_minor = 0,
 	.plugin.type = DB_PLUGIN_VFS,
 	.plugin.id = "vfs_archive",
 	.plugin.name = "Archive vfs",
 	.plugin.descr = "play files directly from archive files",
 	.plugin.copyright =
-		"Copyright (C) 2012 Shao Hao <shaohao@users.sourceforge.net>\n"
+		"Copyright (C) 2013 Shao Hao <shaohao@users.sourceforge.net>\n"
 		"\n"
 		"This program is free software; you can redistribute it and/or\n"
 		"modify it under the terms of the GNU General Public License\n"
