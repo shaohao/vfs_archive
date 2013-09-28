@@ -507,8 +507,6 @@ vfs_archive_scandir(
 {
 	trace("[vfs_archive_scandir]\n");
 
-	int n;
-
 	struct archive *a;
 	struct archive_entry *ae;
 
@@ -520,7 +518,11 @@ vfs_archive_scandir(
 	if (ARCHIVE_OK != archive_read_open_filename(a, dir, 10240))
 		return -1;
 
-	n = 0;
+	const char *ext = strrchr(dir, '.');
+	if (!ext)
+		return -1;
+
+	int n = 0;
 	while (ARCHIVE_OK == archive_read_next_header(a, &ae)) {
 		*namelist = realloc(*namelist, sizeof(void *) * (n + 1));
 		(*namelist)[n] = (struct dirent *)malloc(sizeof(struct dirent));
@@ -528,7 +530,7 @@ vfs_archive_scandir(
 		snprintf(
 			(*namelist)[n]->d_name,
 			sizeof((*namelist)[n]->d_name),
-			"rar://%s:%s", dir, archive_entry_pathname(ae) /*TODO: fix rar */
+			"%s://%s:%s", ext+1, dir, archive_entry_pathname(ae)
 		);
 
 		archive_read_data_skip(a);
